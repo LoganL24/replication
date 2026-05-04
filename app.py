@@ -610,3 +610,195 @@ def assign_participant():
     
     # Redirect to the /study route with the selected parameters
     return redirect(redirect_url)
+
+
+if __name__ == '__main__':
+    import math
+    from collections import defaultdict
+
+    # ── ANSI colour helpers ───────────────────────────────────────────────────
+    _RESET   = "\033[0m"
+    _BOLD    = "\033[1m"
+    _CYAN    = "\033[96m"
+    _MAGENTA = "\033[95m"
+
+    def _tbl_row(cells, widths, sep="│"):
+        return sep + sep.join(str(cell).ljust(w)[:w] for cell, w in zip(cells, widths)) + sep
+
+    def _tbl_div(widths, l="├", m="┼", r="┤", h="─"):
+        return l + m.join(h * w for w in widths) + r
+
+    def _tbl_top(widths):
+        return "┌" + "┬".join("─" * w for w in widths) + "┐"
+
+    def _tbl_bot(widths):
+        return "└" + "┴".join("─" * w for w in widths) + "┘"
+
+    # ── Load data & train implicit model (via MovieRecommender) ───────────────
+    print(f"\n{_BOLD}{_CYAN}{'━'*70}{_RESET}")
+    print(f"{_BOLD}{_CYAN}  Loading data and training models…{_RESET}")
+    print(f"{_BOLD}{_CYAN}{'━'*70}{_RESET}")
+
+    movies_df_main  = load_movies(MOVIES_PATH)
+    ratings_df_main = load_ratings(RATINGS_PATH)
+    rec_main = MovieRecommender(movies_df_main, ratings_df_main)
+
+    # ── Train Explicit MF model (spotlight ExplicitFactorizationModel) ────────
+    print("Training Explicit MF model…")
+    expl_model = ExplicitFactorizationModel(n_iter=10, random_state=np.random.RandomState(42))
+    expl_model.fit(rec_main.train_interactions)
+    expl_train_rmse = float(rmse_score(expl_model, rec_main.train_interactions))
+    expl_test_rmse  = float(rmse_score(expl_model, rec_main.test_interactions))
+
+    # ── Metric helpers ────────────────────────────────────────────────────────
+    def _ndcg_at_k(ranked, relevant, k):
+        dcg  = sum(1.0 / math.log2(r + 1)
+                   for r, item in enumerate(ranked[:k], 1) if item in relevant)
+        ideal = min(len(relevant), k)
+        idcg  = sum(1.0 / math.log2(r + 1) for r in range(1, ideal + 1))
+        return dcg / idcg if idcg > 0 else 0.0
+
+    def _prec_at_k(ranked, relevant, k):
+        return sum(1 for i in ranked[:k] if i in relevant) / k if k > 0 else 0.0
+
+    def _eval_split(model, interactions_df, k=10, threshold=4.0):
+        n_items    = len(rec_main.item_id_map)
+        all_items_arr = np.arange(n_items)
+        ndcg_vals, prec_vals = [], []
+        for u in interactions_df["user_id"].unique():
+            mask     = interactions_df["user_id"] == u
+            relevant = set(interactions_df.loc[
+                mask & (interactions_df["rating"] >= threshold), "item_id"])
+            if not relevant:
+                continue
+            scores = model.predict(u, all_items_arr)
+            ranked = list(np.argsort(-scores))
+            ndcg_vals.append(_ndcg_at_k(ranked, relevant, k))
+            prec_vals.append(_prec_at_k(ranked, relevant, k))
+        ndcg = float(np.mean(ndcg_vals)) if ndcg_vals else 0.0
+        prec = float(np.mean(prec_vals)) if prec_vals else 0.0
+        return ndcg, prec
+
+    # Build DataFrames from split interactions
+    train_df_main = pd.DataFrame({
+        "user_id": rec_main.train_interactions.user_ids.astype(int),
+        "item_id": rec_main.train_interactions.item_ids.astype(int),
+        "rating":  rec_main.train_interactions.ratings.astype(float),
+    })
+    test_df_main = pd.DataFrame({
+        "user_id": rec_main.test_interactions.user_ids.astype(int),
+        "item_id": rec_main.test_interactions.item_ids.astype(int),
+        "rating":  rec_main.test_interactions.ratings.astype(float),
+    })
+
+    print("Computing NDCG & Precision for Implicit MF…")
+    impl_train_ndcg, impl_train_prec_nd = _eval_split(rec_main.model, train_df_main)
+    impl_test_ndcg,  impl_test_prec_nd  = _eval_split(rec_main.model, test_df_main)
+
+    print("Computing NDCG & Precision for Explicit MF…")
+    expl_train_ndcg, expl_train_prec_nd = _eval_split(expl_model, train_df_main)
+    expl_test_ndcg,  expl_test_prec_nd  = _eval_split(expl_model, test_df_main)
+
+    # ── Cosine similarity: Carousel vs Ranked List ────────────────────────────
+    print("Computing Carousel vs List cosine similarity…")
+
+    # Build internal item_id → genres and genre → [item_ids] maps
+    _item_genre_map: dict = {}
+    for _, row in rec_main.movies_df[
+            rec_main.movies_df["movieId"].isin(rec_main.item_id_map.values())].iterrows():
+        iid = rec_main.reverse_item_id_map.get(row["movieId"])
+        if iid is not None:
+            _item_genre_map[iid] = row["genres"].split("|")
+
+    _genre_to_items: dict = defaultdict(list)
+    for iid, genres in _item_genre_map.items():
+        for g in genres:
+            _genre_to_items[g].append(iid)
+
+    _N_ITEMS      = len(rec_main.item_id_map)
+    _TOP_K        = 10
+    _NUM_CAROUSELS    = 5
+    _ITEMS_PER_CAR    = 10
+    _N_SAMPLE_USERS   = min(100, len(rec_main.user_id_map))
+    _all_items_arr    = np.arange(_N_ITEMS)
+
+    def _cosine_sim(a, b):
+        na, nb = np.linalg.norm(a), np.linalg.norm(b)
+        return float(np.dot(a, b) / (na * nb)) if na > 0 and nb > 0 else 0.0
+
+    def _carousel_set(scores_arr):
+        """Return the set of internal item IDs shown in a carousel view."""
+        item_scores_loc = {i: float(scores_arr[i]) for i in range(_N_ITEMS)}
+        genre_sums = {g: sum(item_scores_loc.get(i, 0.0) for i in items)
+                      for g, items in _genre_to_items.items()}
+        top_genres = sorted(genre_sums, key=genre_sums.get, reverse=True)[:_NUM_CAROUSELS]
+        shown: set = set()
+        for g in top_genres:
+            top_in_genre = sorted(_genre_to_items[g],
+                                  key=lambda i: -item_scores_loc.get(i, 0.0))[:_ITEMS_PER_CAR]
+            shown.update(top_in_genre)
+        return shown
+
+    cos_sim_impl_vals = []
+    cos_sim_expl_vals = []
+    for uid_int in range(_N_SAMPLE_USERS):
+        # Implicit MF
+        impl_scores = rec_main.model.predict(uid_int, _all_items_arr)
+        list_top_impl = set(np.argsort(-impl_scores)[:_TOP_K])
+        list_vec_impl = np.array([1.0 if i in list_top_impl else 0.0 for i in range(_N_ITEMS)])
+        car_items_impl = _carousel_set(impl_scores)
+        car_vec_impl   = np.array([1.0 if i in car_items_impl else 0.0 for i in range(_N_ITEMS)])
+        cos_sim_impl_vals.append(_cosine_sim(list_vec_impl, car_vec_impl))
+
+        # Explicit MF
+        expl_scores = expl_model.predict(uid_int, _all_items_arr)
+        list_top_expl = set(np.argsort(-expl_scores)[:_TOP_K])
+        list_vec_expl = np.array([1.0 if i in list_top_expl else 0.0 for i in range(_N_ITEMS)])
+        car_items_expl = _carousel_set(expl_scores)
+        car_vec_expl   = np.array([1.0 if i in car_items_expl else 0.0 for i in range(_N_ITEMS)])
+        cos_sim_expl_vals.append(_cosine_sim(list_vec_expl, car_vec_expl))
+
+    avg_cos_impl = float(np.mean(cos_sim_impl_vals))
+    avg_cos_expl = float(np.mean(cos_sim_expl_vals))
+
+    # ── Print tables ──────────────────────────────────────────────────────────
+    print(f"\n{_BOLD}{_CYAN}{'═'*70}{_RESET}")
+    print(f"{_BOLD}{_CYAN}  Movie Recommender — Terminal Report{_RESET}")
+    print(f"{_BOLD}{_CYAN}  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{_RESET}")
+    print(f"{_BOLD}{_CYAN}{'═'*70}{_RESET}\n")
+
+    # Table 1: Cosine similarity — Carousel vs Ranked List
+    print(f"{_BOLD}{_MAGENTA}  ◆ TABLE 1 — Cosine Similarity: Carousel vs Ranked List"
+          f" (top-{_TOP_K}, mean over {_N_SAMPLE_USERS} users){_RESET}")
+    _w1 = [20, 24]
+    print("  " + _tbl_top(_w1))
+    print("  " + _tbl_row([f"{_BOLD}Model{_RESET}", f"{_BOLD}Cosine Similarity{_RESET}"], _w1))
+    print("  " + _tbl_div(_w1))
+    print("  " + _tbl_row(["Implicit MF", f"{avg_cos_impl:.4f}"], _w1))
+    print("  " + _tbl_row(["Explicit MF", f"{avg_cos_expl:.4f}"], _w1))
+    print("  " + _tbl_bot(_w1))
+
+    # Table 2: RMSE, NDCG@10 & Precision@10 — Explicit vs Implicit MF
+    print(f"\n{_BOLD}{_MAGENTA}  ◆ TABLE 2 — RMSE, NDCG@10 & Precision@10:"
+          f" Explicit vs Implicit MF{_RESET}")
+    _w2 = [14, 12, 10, 14, 12, 12, 10]
+    _h2 = ["Model", "Train RMSE", "Test RMSE",
+           "Train NDCG@10", "Test NDCG@10", "Train P@10", "Test P@10"]
+    print("  " + _tbl_top(_w2))
+    print("  " + _tbl_row([f"{_BOLD}{h}{_RESET}" for h in _h2], _w2))
+    print("  " + _tbl_div(_w2))
+    print("  " + _tbl_row([
+        "Implicit MF",
+        f"{rec_main.train_rmse:.4f}", f"{rec_main.test_rmse:.4f}",
+        f"{impl_train_ndcg:.4f}", f"{impl_test_ndcg:.4f}",
+        f"{impl_train_prec_nd:.4f}", f"{impl_test_prec_nd:.4f}",
+    ], _w2))
+    print("  " + _tbl_row([
+        "Explicit MF",
+        f"{expl_train_rmse:.4f}", f"{expl_test_rmse:.4f}",
+        f"{expl_train_ndcg:.4f}", f"{expl_test_ndcg:.4f}",
+        f"{expl_train_prec_nd:.4f}", f"{expl_test_prec_nd:.4f}",
+    ], _w2))
+    print("  " + _tbl_bot(_w2))
+
+    app.run(debug=True)
