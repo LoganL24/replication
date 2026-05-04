@@ -11,6 +11,10 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
+# Import shared classes and functions directly from app.py so simulate.py
+# works with the same implementation rather than re-implementing them.
+from app import MovieRecommender, update_item_scores
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 0.  Parse args
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,102 +86,52 @@ def generate_data(n_movies=300, n_users=500, n_ratings=15000, seed=42):
 header("STEP 1 — Generating synthetic data")
 movies_df, ratings_df = generate_data(n_movies=300, n_users=500, n_ratings=20000, seed=args.seed)
 ok(f"{len(movies_df)} movies, {len(ratings_df)} unique ratings, {ratings_df['userId'].nunique()} users")
-
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  Preprocessing (mirrors MovieRecommender._preprocess_data)
+# 3.  Preprocessing & model setup — delegated to app.py's MovieRecommender
 # ─────────────────────────────────────────────────────────────────────────────
-header("STEP 2 — Preprocessing")
+header("STEP 2 — Preprocessing (via app.py MovieRecommender)")
 
-mdf = movies_df[movies_df["genres"] != "(no genres listed)"].copy()
-rdf = ratings_df[ratings_df["movieId"].isin(mdf["movieId"])].copy()
+rec = MovieRecommender(movies_df, ratings_df, top_n=args.top_n)
 
-top_movies = (rdf.groupby("movieId")["rating"].sum()
-              .sort_values(ascending=False).head(args.top_n).index.tolist())
-rdf = rdf[rdf["movieId"].isin(top_movies)].reset_index(drop=True)
-
-user_cats = pd.Categorical(rdf["userId"])
-item_cats = pd.Categorical(rdf["movieId"])
-rdf["user_id"] = user_cats.codes
-rdf["item_id"] = item_cats.codes
-user_id_map  = dict(enumerate(user_cats.categories))   # internal → original
-item_id_map  = dict(enumerate(item_cats.categories))
-rev_user_map = {v: k for k, v in user_id_map.items()}
-rev_item_map = {v: k for k, v in item_id_map.items()}
-
-n_users_proc = len(user_id_map)
-n_items_proc = len(item_id_map)
+# Expose the internals produced by MovieRecommender._preprocess_data
+rdf          = rec.ratings_df
+n_users_proc = len(rec.user_id_map)
+n_items_proc = len(rec.item_id_map)
 ok(f"After filtering: {n_items_proc} items, {n_users_proc} users, {len(rdf)} ratings")
 
-# Train/test split (80/20 row-wise, reproducible)
-rng_split = np.random.RandomState(args.seed)
-test_mask = rng_split.random(len(rdf)) < 0.2
-train_df  = rdf[~test_mask].copy()
-test_df   = rdf[test_mask].copy()
+# Convert Spotlight Interactions → DataFrames for metric functions below
+train_df = pd.DataFrame({
+    "user_id": rec.train_interactions.user_ids.astype(int),
+    "item_id": rec.train_interactions.item_ids.astype(int),
+    "rating":  rec.train_interactions.ratings.astype(float),
+})
+test_df = pd.DataFrame({
+    "user_id": rec.test_interactions.user_ids.astype(int),
+    "item_id": rec.test_interactions.item_ids.astype(int),
+    "rating":  rec.test_interactions.ratings.astype(float),
+})
 ok(f"Train: {len(train_df)} rows | Test: {len(test_df)} rows")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  Algorithm implementations (no Spotlight dependency required)
+# 4.  Algorithm implementations
 # ─────────────────────────────────────────────────────────────────────────────
 header("STEP 3 — Training recommendation algorithms")
 
-# ── 4a. Matrix Factorisation (SGD) — mirrors app.py's Spotlight model interface ──
-# ImplicitFactorizationModel and ExplicitFactorizationModel mirror the classes
-# used in app.py (_train_model), recording rmse_score and precision_at_k for both.
-class ImplicitFactorizationModel:
-    def __init__(self, n_users, n_items, n_factors=20, n_iter=15, lr=0.01,
-                 reg=0.02, seed=42):
-        rng = np.random.RandomState(seed)
-        self.P  = rng.normal(0, 0.1, (n_users, n_factors))
-        self.Q  = rng.normal(0, 0.1, (n_items, n_factors))
-        self.bu = np.zeros(n_users)
-        self.bi = np.zeros(n_items)
-        self.mu = 0.0
-        self.n_factors = n_factors
-        self.n_iter    = n_iter
-        self.lr        = lr
-        self.reg       = reg
+# ── 4a. Implicit MF — provided by app.py's MovieRecommender (already trained) ─
+# rec.model  : Spotlight ImplicitFactorizationModel, trained via rec._train_model
+# rec.train_rmse / rec.test_rmse / rec.train_precision / rec.test_precision
+#   are computed by MovieRecommender._train_model and stored for Table 2.
+impl_train_rmse = rec.train_rmse
+impl_test_rmse  = rec.test_rmse
+impl_train_prec = rec.train_precision
+impl_test_prec  = rec.test_precision
+ok(f"Implicit MF (app.py MovieRecommender): train RMSE={impl_train_rmse:.4f}  test RMSE={impl_test_rmse:.4f}"
+   f"  |  train P@10={impl_train_prec:.4f}  test P@10={impl_test_prec:.4f}")
 
-    def fit(self, train_df):
-        self.mu = train_df["rating"].mean()
-        records = list(zip(train_df["user_id"], train_df["item_id"], train_df["rating"]))
-        for epoch in range(self.n_iter):
-            random.shuffle(records)
-            for u, i, r in records:
-                target = 1.0           # implicit: any interaction = positive signal
-                pred   = self._predict_one(u, i)
-                err    = target - pred
-                self.bu[u] += self.lr * (err - self.reg * self.bu[u])
-                self.bi[i] += self.lr * (err - self.reg * self.bi[i])
-                self.P[u]  += self.lr * (err * self.Q[i] - self.reg * self.P[u])
-                self.Q[i]  += self.lr * (err * self.P[u] - self.reg * self.Q[i])
-
-    def _predict_one(self, u, i):
-        return self.mu + self.bu[u] + self.bi[i] + self.P[u].dot(self.Q[i])
-
-    def predict(self, user_id, item_ids):
-        return np.array([self._predict_one(user_id, i) for i in item_ids])
-
-    def rmse(self, df):
-        preds = np.array([self._predict_one(u, i) for u, i in zip(df["user_id"], df["item_id"])])
-        return float(np.sqrt(np.mean((preds - df["rating"].values) ** 2)))
-
-    def precision_at_k(self, df, k=10, threshold=4.0):
-        """Mirrors app.py's MovieRecommender.precision_at_k."""
-        n_items = self.Q.shape[0]
-        precisions = []
-        for u in df["user_id"].unique():
-            scores      = self.predict(u, np.arange(n_items))
-            top_k_items = np.argsort(-scores)[:k]
-            mask     = df["user_id"] == u
-            relevant = set(df.loc[mask & (df["rating"] >= threshold), "item_id"].tolist())
-            hits     = sum(1 for item in top_k_items if item in relevant)
-            precisions.append(hits / k)
-        return float(np.mean(precisions)) if precisions else 0.0
-
-
+# ── 4b. Explicit MF (SGD) — standalone; app.py uses only Implicit MF ─────────
 class ExplicitFactorizationModel:
-    """Mirrors app.py's spotlight ExplicitFactorizationModel: optimises against
-    the observed rating value rather than a binary implicit target."""
+    """Optimises against the observed rating value (explicit target).
+    Kept here because app.py's MovieRecommender only trains Implicit MF."""
     def __init__(self, n_users, n_items, n_factors=20, n_iter=15, lr=0.01,
                  reg=0.02, seed=42):
         rng = np.random.RandomState(seed)
@@ -216,7 +170,6 @@ class ExplicitFactorizationModel:
         return float(np.sqrt(np.mean((preds - df["rating"].values) ** 2)))
 
     def precision_at_k(self, df, k=10, threshold=4.0):
-        """Mirrors app.py's MovieRecommender.precision_at_k."""
         n_items = self.Q.shape[0]
         precisions = []
         for u in df["user_id"].unique():
@@ -228,18 +181,6 @@ class ExplicitFactorizationModel:
             precisions.append(hits / k)
         return float(np.mean(precisions)) if precisions else 0.0
 
-
-sub("Training Implicit MF (ImplicitFactorizationModel) …")
-t0 = time.time()
-mf_implicit = ImplicitFactorizationModel(n_users_proc, n_items_proc, n_factors=20,
-                                          n_iter=20, seed=args.seed)
-mf_implicit.fit(train_df)
-impl_train_rmse = mf_implicit.rmse(train_df)
-impl_test_rmse  = mf_implicit.rmse(test_df)
-impl_train_prec = mf_implicit.precision_at_k(train_df, k=10)
-impl_test_prec  = mf_implicit.precision_at_k(test_df,  k=10)
-ok(f"Done in {time.time()-t0:.1f}s  |  train RMSE={impl_train_rmse:.4f}  test RMSE={impl_test_rmse:.4f}"
-   f"  |  train P@10={impl_train_prec:.4f}  test P@10={impl_test_prec:.4f}")
 
 sub("Training Explicit MF (ExplicitFactorizationModel) …")
 t0 = time.time()
@@ -253,11 +194,11 @@ expl_test_prec  = mf_explicit.precision_at_k(test_df,  k=10)
 ok(f"Done in {time.time()-t0:.1f}s  |  train RMSE={expl_train_rmse:.4f}  test RMSE={expl_test_rmse:.4f}"
    f"  |  train P@10={expl_train_prec:.4f}  test P@10={expl_test_prec:.4f}")
 
-# ── 4b. Popularity baseline ───────────────────────────────────────────────────
+# ── 4c. Popularity baseline ───────────────────────────────────────────────────
 popularity_scores = (rdf.groupby("item_id")["rating"].sum()
                      .reindex(range(n_items_proc), fill_value=0.0))
 
-# ── 4c. Random baseline ────────────────────────────────────────────────────────
+# ── 4d. Random baseline ────────────────────────────────────────────────────────
 ok("Popularity and Random baselines ready (no training required)")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -324,10 +265,10 @@ def cosine_sim(a, b):
         return 0.0
     return float(np.dot(a, b) / (na * nb))
 
-# Pre-build genre map: item_id → frozenset of genres
+# Pre-build genre map: item_id → frozenset of genres (using rec.movies_df from app.py)
 item_genre_map = {}
-for _, row in mdf[mdf["movieId"].isin(item_id_map.values())].iterrows():
-    iid = rev_item_map.get(row["movieId"])
+for _, row in rec.movies_df[rec.movies_df["movieId"].isin(rec.item_id_map.values())].iterrows():
+    iid = rec.reverse_item_id_map.get(row["movieId"])
     if iid is not None:
         item_genre_map[iid] = frozenset(row["genres"].split("|"))
 
@@ -358,6 +299,13 @@ def evaluate_model(model_fn, split_df, k_values, label):
 
 all_items = np.arange(n_items_proc)
 
+def make_mf_fn_from_recommender(model_rec):
+    """Wrap app.py's MovieRecommender model for ranking evaluation."""
+    def fn(u):
+        scores = model_rec.model.predict(u, all_items)
+        return list(np.argsort(-scores))
+    return fn
+
 def make_mf_fn(model):
     def fn(u):
         scores = model.predict(u, all_items)
@@ -373,7 +321,7 @@ def random_fn(u):
 header("STEP 4 — Evaluating algorithms (train & test splits)")
 
 ALGOS = {
-    "Implicit MF": make_mf_fn(mf_implicit),
+    "Implicit MF": make_mf_fn_from_recommender(rec),
     "Explicit MF": make_mf_fn(mf_explicit),
     "Popularity":  popularity_fn,
     "Random":      random_fn,
@@ -413,50 +361,37 @@ for name, fn in ALGOS.items():
        (f"  test RMSE={test_rmse:.4f}" if test_rmse else ""))
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 6.  Score update — mirrors app.py update_item_scores exactly
+# 6.  Score update — delegated to app.py's update_item_scores
 # ─────────────────────────────────────────────────────────────────────────────
-def update_scores(item_scores, clicked_id, seen_ids,
-                  positive_factor=0.05, negative_factor=0.01):
+# update_item_scores is imported from app.py.  The session simulation works
+# with internal item IDs, so _apply_update_item_scores converts between the
+# internal-ID space used here and the movieId space expected by app.py.
+
+def _update_item_scores_with_id_conversion(item_scores, clicked_id, seen_ids,
+                               positive_factor=0.05, negative_factor=0.01):
     """
-    Exact port of app.py update_item_scores (adaptive branch).
+    Thin wrapper around app.py's update_item_scores for the simulation.
 
-    1. Collect clicked item's genres.
-    2. Collect all genres from seen-but-not-clicked items → negative_genres
-       (excluding genres present in the clicked item).
-    3. For every item in item_scores:
-         • If it shares any genre with negative_genres → decrease by negative_factor.
-         • If its genres exactly equal (clicked_genres − negative_genres) → also decrease.
-         • If it shares any genre with clicked_genres (and isn't the clicked item) → increase.
+    Converts internal item IDs → original movieIds before the call, then
+    converts the returned scores back to internal IDs so that the caller
+    can continue working in the simulation's internal-ID space.
     """
-    clicked_genres = item_genre_map.get(clicked_id, frozenset())
+    id_map  = rec.item_id_map           # internal → movieId
+    rev_map = rec.reverse_item_id_map   # movieId  → internal
 
-    seen_set = set(seen_ids)
-    seen_genres = set()
-    for sid in seen_set:
-        seen_genres |= item_genre_map.get(sid, frozenset())
-    negative_genres = seen_genres - clicked_genres
+    movie_scores  = {id_map[iid]: score for iid, score in item_scores.items()}
+    movie_clicked = id_map[clicked_id]
+    movie_seen    = [id_map[s] for s in seen_ids]
 
-    new_scores = dict(item_scores)
-
-    # Pass 1: decrease scores for items with negative genres
-    for iid in new_scores:
-        iid_genres = item_genre_map.get(iid, frozenset())
-        if iid_genres & negative_genres:
-            new_scores[iid] = max(0.0, new_scores[iid] - new_scores[iid] * negative_factor)
-        # Also decrease if exact genre combo matches clicked_genres minus negative_genres
-        if iid_genres == (clicked_genres - negative_genres):
-            new_scores[iid] = max(0.0, new_scores[iid] - new_scores[iid] * negative_factor)
-
-    # Pass 2: increase scores for items sharing any genre with clicked item
-    for iid in new_scores:
-        if iid == clicked_id:
-            continue
-        iid_genres = item_genre_map.get(iid, frozenset())
-        if clicked_genres & iid_genres:
-            new_scores[iid] = new_scores[iid] + new_scores[iid] * positive_factor
-
-    return new_scores
+    updated = update_item_scores(
+        movie_scores, movie_clicked, movie_seen, rec,
+        positive_factor=positive_factor,
+        negative_factor=negative_factor,
+        update_type='adaptive',
+    )
+    return {rev_map[mid]: score for mid, score in updated.items()}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7.  Experiment simulation
@@ -518,11 +453,11 @@ def simulate_session(user_internal_id, update_type, baseline_type,
     else:
         item_scores = {i: float(np.random.rand()) for i in range(n_items_proc)}
 
-    # ── Gold standard — raw MF scores, fixed for this session (§3.4.1) ────────
+    # ── Gold standard — raw MF scores from app.py's model, fixed for session ──
     # Gold scores are from the trained MF model and stay on their native scale.
     # Item scores are normalised to [0,1] each iteration for the threshold
     # comparison so the click rule is scale-invariant across both baselines.
-    gold_mf_impl  = mf_implicit.predict(user_internal_id, np.arange(n_items_proc))
+    gold_mf_impl  = rec.model.predict(user_internal_id, np.arange(n_items_proc))
     gold_top_impl = set(np.argsort(-gold_mf_impl)[:top_k])
     gold_vec_impl = np.array([1.0 if i in gold_top_impl else 0.0
                               for i in range(n_items_proc)])
@@ -597,9 +532,9 @@ def simulate_session(user_internal_id, update_type, baseline_type,
                     clicked.append(iid)
                     break
 
-        # ── Score update (mirrors app.py update_item_scores, adaptive only) ────
+        # ── Score update — calls app.py's update_item_scores via wrapper ────────
         if update_type == "adaptive" and clicked_this_iter is not None:
-            item_scores = update_scores(
+            item_scores = _update_item_scores_with_id_conversion(
                 item_scores, clicked_this_iter,
                 [s for s in seen_this_iter if s != clicked_this_iter],
                 POS_FACTOR, NEG_FACTOR,
@@ -619,7 +554,7 @@ def simulate_session(user_internal_id, update_type, baseline_type,
 
 group_sim_results = {}
 n_sim_users = min(args.users, n_users_proc)
-sim_user_ids = list(user_id_map.keys())[:n_sim_users]  # internal IDs
+sim_user_ids = list(rec.user_id_map.keys())[:n_sim_users]  # internal IDs
 
 for g_idx, (update_type, baseline_type, ui_type) in GROUP_MAP.items():
     label = f"Group {g_idx} [{update_type}/{baseline_type}/{ui_type}]"
