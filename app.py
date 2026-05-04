@@ -182,10 +182,18 @@ def load_ratings(ratings_path):
         print(f"Error loading ratings data: {e}")
         raise
 
-# Initialize recommender
-movies_df = load_movies(MOVIES_PATH)
-ratings_df = load_ratings(RATINGS_PATH)
-recommender = MovieRecommender(movies_df, ratings_df)
+# Lazy initialization — allows app.py to be imported by simulate.py without
+# requiring the data files to exist at import time.
+_recommender = None
+
+def get_recommender():
+    """Return the global MovieRecommender, initialising it on first call."""
+    global _recommender
+    if _recommender is None:
+        movies_df = load_movies(MOVIES_PATH)
+        ratings_df = load_ratings(RATINGS_PATH)
+        _recommender = MovieRecommender(movies_df, ratings_df)
+    return _recommender
 
 # Helper function to update item scores based on user interaction
 def update_item_scores(item_scores, clicked_item_id, seen_items, recommender, positive_factor=0.05, negative_factor=0.01, update_type='adaptive'):
@@ -355,7 +363,7 @@ def landing_page():
         # Initialize item_scores based on baseline
         num_items = 500
         baseline_recommendations = get_baseline_recommendations(
-            recommender,
+            get_recommender(),
             baseline_type=baseline_type,
             num_items=num_items,
             recommendation_type=recommendation_type,
@@ -388,7 +396,7 @@ def landing_page():
     recommendations = get_current_recommendations(
         item_scores,
         clicked_items,
-        recommender,
+        get_recommender(),
         recommendation_type=recommendation_type,
         num_items=50,
         random_update=False,
@@ -465,7 +473,7 @@ def click():
             item_scores,
             clicked_item_id,
             seen_items,
-            recommender,
+            get_recommender(),
             positive_factor=0.05,
             negative_factor=0.01,
             update_type=update_type
