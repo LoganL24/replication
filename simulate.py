@@ -698,6 +698,67 @@ for g, r in group_sim_results.items():
     print("  " + tbl_row(row3, widths3))
 print("  " + tbl_bot(widths3))
 
+# ── Table 4: Cosine Similarity — Carousel vs Ranked List ──────────────────
+print(f"\n{c('  ◆ TABLE 4 — Cosine Similarity: Carousel vs Ranked List (mean over iterations)', BOLD, MAGENTA)}")
+# Build a lookup: (update_type, baseline, ui) → mean similarity for impl and expl
+def _mean_sim(sim_curve):
+    return float(np.mean(sim_curve)) if sim_curve else 0.0
+
+ui_sim_lookup = {}
+for g, r in group_sim_results.items():
+    key = (r["update_type"], r["baseline"], r["ui"])
+    ui_sim_lookup[key] = {
+        "impl": _mean_sim(r["sim_curve_impl"]),
+        "expl": _mean_sim(r["sim_curve_expl"]),
+    }
+
+widths4 = [10, 12, 16, 14, 16, 14]
+h4 = ["Update", "Baseline", "Carousel(Impl)", "List(Impl)", "Carousel(Expl)", "List(Expl)"]
+print("  " + tbl_top(widths4))
+print("  " + tbl_row([c(h, BOLD) for h in h4], widths4))
+print("  " + tbl_divider(widths4))
+for upd in ["control", "adaptive"]:
+    for base in ["random", "popularity"]:
+        car_impl = ui_sim_lookup.get((upd, base, "carousel"), {}).get("impl", 0.0)
+        lst_impl = ui_sim_lookup.get((upd, base, "list"),     {}).get("impl", 0.0)
+        car_expl = ui_sim_lookup.get((upd, base, "carousel"), {}).get("expl", 0.0)
+        lst_expl = ui_sim_lookup.get((upd, base, "list"),     {}).get("expl", 0.0)
+        print("  " + tbl_row([
+            upd, base,
+            f"{car_impl:.4f}", f"{lst_impl:.4f}",
+            f"{car_expl:.4f}", f"{lst_expl:.4f}",
+        ], widths4))
+print("  " + tbl_bot(widths4))
+
+# ── Table 5: RMSE, nDCG & Precision — Explicit vs Implicit MF ────────────
+print(f"\n{c(f'  ◆ TABLE 5 — RMSE, NDCG@{k_val} & Precision@10: Explicit vs Implicit MF', BOLD, MAGENTA)}")
+widths5 = [20, 12, 12, 16, 14, 13, 11]
+h5 = ["Model", "Train RMSE", "Test RMSE",
+      f"Train NDCG@{k_val}", f"Test NDCG@{k_val}",
+      "Train P@10", "Test P@10"]
+print("  " + tbl_top(widths5))
+print("  " + tbl_row([c(h, BOLD) for h in h5], widths5))
+print("  " + tbl_divider(widths5))
+for name in ["Implicit MF", "Explicit MF"]:
+    res = algo_results.get(name)
+    if res is None:
+        continue
+    tr_ndcg = res["train"].get(f"NDCG@{k_val}", 0.0)
+    te_ndcg = res["test"].get(f"NDCG@{k_val}", 0.0)
+    tr_rmse = res["train_rmse"]
+    te_rmse = res["test_rmse"]
+    tr_prec = res["train_precision"]
+    te_prec = res["test_precision"]
+    print("  " + tbl_row([
+        name,
+        f"{tr_rmse:.4f}" if tr_rmse is not None else "N/A",
+        f"{te_rmse:.4f}" if te_rmse is not None else "N/A",
+        f"{tr_ndcg:.4f}", f"{te_ndcg:.4f}",
+        f"{tr_prec:.4f}" if tr_prec is not None else "N/A",
+        f"{te_prec:.4f}" if te_prec is not None else "N/A",
+    ], widths5))
+print("  " + tbl_bot(widths5))
+
 # ── Key findings ──────────────────────────────────────────────────────────
 print(f"\n{c('  ◆ KEY FINDINGS', BOLD, MAGENTA)}")
 
