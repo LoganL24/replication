@@ -692,25 +692,25 @@ if __name__ == '__main__':
     })
 
     print("Computing NDCG & Precision for Implicit MF…")
-    impl_train_ndcg, impl_train_prec_nd = _eval_split(rec_main.model, train_df_main)
-    impl_test_ndcg,  impl_test_prec_nd  = _eval_split(rec_main.model, test_df_main)
+    impl_train_ndcg, impl_train_prec = _eval_split(rec_main.model, train_df_main)
+    impl_test_ndcg,  impl_test_prec  = _eval_split(rec_main.model, test_df_main)
 
     print("Computing NDCG & Precision for Explicit MF…")
-    expl_train_ndcg, expl_train_prec_nd = _eval_split(expl_model, train_df_main)
-    expl_test_ndcg,  expl_test_prec_nd  = _eval_split(expl_model, test_df_main)
+    expl_train_ndcg, expl_train_prec = _eval_split(expl_model, train_df_main)
+    expl_test_ndcg,  expl_test_prec  = _eval_split(expl_model, test_df_main)
 
     # ── Cosine similarity: Carousel vs Ranked List ────────────────────────────
     print("Computing Carousel vs List cosine similarity…")
 
     # Build internal item_id → genres and genre → [item_ids] maps
-    _item_genre_map: dict = {}
+    _item_genre_map = {}
     for _, row in rec_main.movies_df[
             rec_main.movies_df["movieId"].isin(rec_main.item_id_map.values())].iterrows():
         iid = rec_main.reverse_item_id_map.get(row["movieId"])
         if iid is not None:
             _item_genre_map[iid] = row["genres"].split("|")
 
-    _genre_to_items: dict = defaultdict(list)
+    _genre_to_items = defaultdict(list)
     for iid, genres in _item_genre_map.items():
         for g in genres:
             _genre_to_items[g].append(iid)
@@ -791,14 +791,14 @@ if __name__ == '__main__':
         "Implicit MF",
         f"{rec_main.train_rmse:.4f}", f"{rec_main.test_rmse:.4f}",
         f"{impl_train_ndcg:.4f}", f"{impl_test_ndcg:.4f}",
-        f"{impl_train_prec_nd:.4f}", f"{impl_test_prec_nd:.4f}",
+        f"{impl_train_prec:.4f}", f"{impl_test_prec:.4f}",
     ], _w2))
     print("  " + _tbl_row([
         "Explicit MF",
         f"{expl_train_rmse:.4f}", f"{expl_test_rmse:.4f}",
         f"{expl_train_ndcg:.4f}", f"{expl_test_ndcg:.4f}",
-        f"{expl_train_prec_nd:.4f}", f"{expl_test_prec_nd:.4f}",
+        f"{expl_train_prec:.4f}", f"{expl_test_prec:.4f}",
     ], _w2))
     print("  " + _tbl_bot(_w2))
 
-    app.run(debug=True)
+    app.run(debug=os.environ.get('FLASK_DEBUG', 'false').lower() == 'true')
